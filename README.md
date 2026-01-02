@@ -24,12 +24,8 @@ This project uses **Google Gemini 1.5 Flash** as the LLM and **ChromaDB** for ve
 ## 📂 Project Structure
 
 ```bash
-├── app.py                  # Main Streamlit application file
+├── home.py                  # Main Streamlit application file
 ├── data_ingestion.ipynb    # Jupyter Notebook to process PDFs/URLs and save to DB
 ├── requirements.txt        # List of dependencies
 ├── .env                    # API Keys (Not uploaded to GitHub)
-├── college_data/           # Folder containing your PDF files
-│   ├── Règlement.pdf
-│   ├── Calendrier.pdf
-│   └── ...
 └── chroma_db/              # Generated Vector Database (Created by the notebook)
