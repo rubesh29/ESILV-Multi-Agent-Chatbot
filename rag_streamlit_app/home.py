@@ -1,106 +1,142 @@
-import os
 import streamlit as st
-from dotenv import load_dotenv
-
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+import pandas as pd
+import os
+import csv
 from langchain_community.vectorstores import Chroma
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.document_loaders import PyPDFLoader
+from langchain.tools import tool
+from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 
-# ---------------------------------------------------
-# Load environment variables
-# ---------------------------------------------------
-load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# --- CONFIGURATION ---
+DB_PATH = "./chroma_db"
+LEADS_FILE = "student_leads.csv"
 
-if not GOOGLE_API_KEY:
-    st.error("❌ GOOGLE_API_KEY not found. Please set it in .env file.")
-    st.stop()
+st.set_page_config(page_title="ESILV Local AI", page_icon="🦙", layout="wide")
 
-# ---------------------------------------------------
-# Streamlit UI setup
-# ---------------------------------------------------
-st.set_page_config(
-    page_title="ESILV RAG Assistant",
-    page_icon="🎓",
-    layout="centered"
-)
+# Ensure leads file exists
+if not os.path.exists(LEADS_FILE):
+    with open(LEADS_FILE, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Name", "Email", "Interest", "Timestamp"])
 
-st.title("🎓 ESILV Engineering Cycle Assistant")
-st.write(
-    "Ask questions about **engineering cycle, internships, calendar, scolarité, and documents**."
-)
+# --- BACKEND LOGIC (Tools & Agent) ---
 
-# ---------------------------------------------------
-# Load RAG chain (no caching to avoid stale UI)
-# ---------------------------------------------------
-def load_rag(api_key):
+@tool
+def retrieve_school_info(query: str):
+    """Finds information about ESILV programs, courses, and rules."""
     try:
-        # Embeddings
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
-            google_api_key=api_key
-        )
-
-        # Vectorstore (update path if needed)
-        vectorstore = Chroma(
-            persist_directory="/Users/rubesh/Documents/genAi_project/chroma_db",
-            embedding_function=embeddings
-        )
-
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-
-        # LLM
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-3-flash-preview",
-            temperature=0.3,
-            google_api_key=api_key
-        )
-
-        # System prompt
-        system_prompt = (
-            "You are a helpful assistant for ESILV students. "
-            "Use ONLY the provided context to answer. "
-            "If the answer is not in the context, say you don't know. "
-            "Answer in French if the question is in French, otherwise English.\n\n"
-            "{context}"
-        )
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("human", "{input}")
-        ])
-
-        qa_chain = create_stuff_documents_chain(llm, prompt)
-        rag_chain = create_retrieval_chain(retriever, qa_chain)
-
-        return rag_chain
-
+        embeddings = OllamaEmbeddings(model="nomic-embed-text")
+        vectorstore = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+        docs = retriever.invoke(query)
+        if not docs:
+            return "No info found in documents."
+        return "\n\n".join([d.page_content for d in docs])
     except Exception as e:
-        st.error(f"⚠️ Failed to load RAG chain: {e}")
-        st.stop()
+        return f"Error: {e}"
 
-# Load the chain
-rag_chain = load_rag(GOOGLE_API_KEY)
+@tool
+def save_contact_info(name: str, email: str, interest: str = "General"):
+    """Saves student contact details for follow-up."""
+    import datetime
+    try:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LEADS_FILE, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([name, email, interest, timestamp])
+        return f"Success! Saved contact for {name}."
+    except Exception as e:
+        return f"Error saving: {e}"
 
-# ---------------------------------------------------
-# User input
-# ---------------------------------------------------
-question = st.text_input(
-    "💬 Ask your question:",
-    placeholder="e.g. What is the structure of the engineering cycle?"
-)
+@st.cache_resource
+def get_agent():
+    # Initialize Ollama Model
+    llm = ChatOllama(model="llama3.1", temperature=0)
+    
+    tools = [retrieve_school_info, save_contact_info]
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", 
+         "You are the AI Assistant for ESILV. "
+         "1. Use 'retrieve_school_info' for questions. "
+         "2. Use 'save_contact_info' if user gives Name/Email to register. "
+         "3. Be concise and polite."),
+        ("human", "{input}"),
+        ("placeholder", "{agent_scratchpad}"),
+    ])
+    
+    agent = create_tool_calling_agent(llm, tools, prompt)
+    return AgentExecutor(agent=agent, tools=tools, verbose=True)
 
-if question:
-    with st.spinner("Thinking... 🤔"):
-        try:
-            response = rag_chain.invoke({"input": question})
-            st.subheader("📌 Answer")
-            st.write(response.get("answer", "No answer returned."))
-        except Exception as e:
-            st.error(f"⚠️ Error while getting answer: {e}")
+def process_file(uploaded_file):
+    """Ingests a PDF using Ollama Embeddings"""
+    temp_path = f"temp_{uploaded_file.name}"
+    with open(temp_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+        
+    loader = PyPDFLoader(temp_path)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splits = splitter.split_documents(docs)
+    
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    vectorstore = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
+    vectorstore.add_documents(splits)
+    
+    os.remove(temp_path)
+    return len(splits)
 
-# Optional footer
-st.markdown("---")
-st.write("🛠 Built with Streamlit and Google Generative AI")
+# --- FRONTEND INTERFACE ---
+
+# Initialize Agent
+if "agent" not in st.session_state:
+    st.session_state.agent = get_agent()
+
+st.sidebar.title("🦙 Local Agent")
+page = st.sidebar.radio("Navigation", ["Chat", "Admin Dashboard"])
+
+if page == "Chat":
+    st.title("🏫 ESILV AI Assistant (Ollama)")
+    
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    if prompt := st.chat_input("Ask a question or register..."):
+        st.chat_message("user").markdown(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking (Llama 3.1)..."):
+                try:
+                    response = st.session_state.agent.invoke({"input": prompt})
+                    answer = response["output"]
+                    st.markdown(answer)
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+elif page == "Admin Dashboard":
+    st.title("🛠️ Admin Panel")
+    
+    tab1, tab2 = st.tabs(["Upload PDFs", "View Leads"])
+    
+    with tab1:
+        uploaded_file = st.file_uploader("Upload PDF", type="pdf")
+        if uploaded_file and st.button("Ingest"):
+            with st.spinner("Processing..."):
+                count = process_file(uploaded_file)
+                st.success(f"Added {count} chunks to knowledge base!")
+                
+    with tab2:
+        if os.path.exists(LEADS_FILE):
+            df = pd.read_csv(LEADS_FILE)
+            st.dataframe(df)
+        else:
+            st.info("No leads yet.")
